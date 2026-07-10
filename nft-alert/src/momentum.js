@@ -68,12 +68,23 @@ export class MomentumWatcher {
     const [a, b, c] = entry.hist.slice(-3);
     const hours1 = Math.max((b.t - a.t) / 3600_000, 0.02);
     const hours2 = Math.max((c.t - b.t) / 3600_000, 0.02);
-    const vel1 = (b.owners - a.owners) / hours1;
-    const vel2 = (c.owners - b.owners) / hours2;
+    const d1 = b.owners - a.owners;
+    const d2 = c.owners - b.owners;
+    const vel1 = d1 / hours1;
+    const vel2 = d2 / hours2;
+    // Velocity over a tiny window is noise (e.g. +2 owners in 5 min looks
+    // like 24/h). Require a minimum total window AND minimum absolute growth
+    // per step, so small-number noise can't fire the early path.
+    const windowOk = (c.t - a.t) >= this.config.minVelocityWindowMin * 60_000;
 
-    // Path 1: velocity, confirmed across two measurements
+    // Path 1: velocity, confirmed across two measurements (can be disabled)
     const earlySignal =
+      this.config.enableEarlySignal &&
+      windowOk &&
+      c.volume1d >= this.config.minVolume1dEthEarly &&
       c.owners >= this.config.minOwnersEarly &&
+      d1 >= this.config.minOwnerDeltaEarly &&
+      d2 >= this.config.minOwnerDeltaEarly &&
       vel1 >= this.config.minOwnerVelocity &&
       vel2 >= this.config.minOwnerVelocity;
 
@@ -88,13 +99,24 @@ export class MomentumWatcher {
 
     // Verification: unique buyer ratio in recent sales
     let buyerRatio = null;
+    let sampleNote = "";
     try {
       const events = await this.opensea.saleEvents(slug, 50);
       if (events.length >= this.config.minSampleSales) {
         const buyers = new Set(events.map((e) => e.buyer).filter(Boolean));
-        buyerRatio = buyers.size / events.length;
+        if (buyers.size > 0) {
+          buyerRatio = buyers.size / events.length;
+        } else {
+          sampleNote = ` (${events.length} sales, no buyer field in API response)`;
+          this.log.warn(`${slug}: sale events have no buyer field - check OpenSea API response shape`);
+        }
+      } else {
+        sampleNote = ` (only ${events.length} sales sampled)`;
       }
-    } catch { /* can proceed without events, ratio = null */ }
+    } catch (err) {
+      sampleNote = " (events API error)";
+      this.log.warn(`${slug}: sale events fetch failed: ${err.message}`);
+    }
 
     if (buyerRatio !== null && buyerRatio < this.config.minUniqueBuyerRatio) {
       entry.holdUntil = Date.now() + 2 * 3600_000;
@@ -125,7 +147,7 @@ export class MomentumWatcher {
         `🔥 GAINING MOMENTUM (${path})\n${name}\n` +
         `Holders: ${c.owners} | velocity: +${Math.round(vel2)}/hour\n` +
         `24h: ${c.volume1d.toFixed(2)} ETH volume, ${c.sales1d} sales\n` +
-        `Unique buyers: ${buyerRatio === null ? "n/a" : Math.round(buyerRatio * 100) + "%"}\n` +
+        `Unique buyers: ${buyerRatio === null ? "n/a" + sampleNote : Math.round(buyerRatio * 100) + "%"}\n` +
         `Floor: ${b.floor || "n/a"} → ${c.floor || "n/a"} ETH ${floorArrow}\n${url}`,
       matched: [path],
     });
